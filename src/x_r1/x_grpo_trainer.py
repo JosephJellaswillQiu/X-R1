@@ -24,7 +24,7 @@ from unittest.mock import patch
 import torch
 import torch.utils.data
 import torch.nn as nn
-import transformers
+import transformers #Hugging Face 的预训练模型和工具。
 from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
 from accelerate.utils.other import is_compiled_module
 from datasets import Dataset, IterableDataset
@@ -44,7 +44,8 @@ from transformers import (
 )
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
-from trl.trainer import GRPOTrainer
+#trl：用于强化学习的 Hugging Face 库
+from trl.trainer import GRPOTrainer 
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from trl.import_utils import is_vllm_available
@@ -68,8 +69,9 @@ if is_wandb_available():
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
-
+#在训练过程中生成重复的样本索引，适用于需要多次重复训练的场景。
 class RepeatRandomSampler(Sampler):
+    
     """
     Sampler that repeats the indices of a dataset in a structured manner.
 
@@ -119,11 +121,11 @@ class RepeatRandomSampler(Sampler):
 
     def __init__(
         self,
-        data_source: Sized,
-        mini_repeat_count: int,
-        batch_size: int = 1,
-        repeat_count: int = 1,
-        seed: Optional[int] = None,
+        data_source: Sized,  #数据集对象，必须实现
+        mini_repeat_count: int, #每个样本索引在一个批次中重复的次数。
+        batch_size: int = 1, #每个批次中包含的唯一样本索引数量（默认为 1）。
+        repeat_count: int = 1,  #整个采样过程的重复次数（默认为 1）。
+        seed: Optional[int] = None, #随机种子，用于控制采样的随机性，确保结果可复现。
     ):
         self.data_source = data_source
         self.mini_repeat_count = mini_repeat_count
@@ -131,67 +133,85 @@ class RepeatRandomSampler(Sampler):
         self.repeat_count = repeat_count
         self.num_samples = len(data_source)
         self.seed = seed
-        self.generator = torch.Generator()  # Create a local random generator
+        self.generator = torch.Generator()  # Create a local random generator 
+        #并根据提供的种子进行初始化。
         if seed is not None:
             self.generator.manual_seed(seed)
-
+            
     def __iter__(self):
         # E.g., [2, 4, 3, 1, 0, 6, 5] (num_samples = 7)
         indexes = torch.randperm(self.num_samples, generator=self.generator).tolist()
+        #使用 torch.randperm 随机生成数据集索引的排列顺序。
 
         #    [2, 4, 3, 1, 0, 6, 5]
         # -> [[2, 4, 3], [1, 0, 6], [5]]  (batch_size = 3)
         indexes = [indexes[i : i + self.batch_size] for i in range(0, len(indexes), self.batch_size)]
+        #将索引列表按 batch_size 分块，确保每个块的大小等于 batch_size。
 
         #    [[2, 4, 3], [1, 0, 6], [5]]
         # -> [[2, 4, 3], [1, 0, 6]]
         indexes = [chunk for chunk in indexes if len(chunk) == self.batch_size]
-
+        #过滤不完整的块
+        
         for chunk in indexes:
             for _ in range(self.repeat_count):
                 for index in chunk:
                     for _ in range(self.mini_repeat_count):
                         yield index
+        #对每个块中的索引，按照 repeat_count 和 mini_repeat_count 的要求进行重复采样。
 
     def __len__(self) -> int:
         return self.num_samples * self.mini_repeat_count * self.repeat_count
+    #返回采样器生成的总样本数
+    #计算公式：数据集样本数 × 每个样本的重复次数 × 采样过程的重复次数。
 
-
+#X-R1 GRPO强化学习训练器
 class XGRPOTrainer(GRPOTrainer):
     # base trl GRPO_trainer
-
-
+    #为模型添加标签，用于标记模型类型（如 trl 和 grpo）。
     _tag_names = ["trl", "grpo"]
 
     def __init__(
         self,
-        model: Union[str, PreTrainedModel],
-        reward_funcs: Union[RewardFunc, list[RewardFunc]],
-        args: Optional[GRPOConfig] = None,
-        train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
-        eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
-        processing_class: Optional[PreTrainedTokenizerBase] = None,
+        model: Union[str, PreTrainedModel], #路径或预训练模型对象
+        reward_funcs: Union[RewardFunc, list[RewardFunc]], #奖励函数或奖励函数列表
+        args: Optional[GRPOConfig] = None, #训练参数，超参数和训练选项
+        train_dataset: Optional[Union[Dataset, IterableDataset]] = None, #训练数据集
+        eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None, 
+        #测试集
+        processing_class: Optional[PreTrainedTokenizerBase] = None, #处理类，如分词器，将数据转换为模型输入格式
         reward_processing_classes: Optional[Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]] = None,
-        callbacks: Optional[list[TrainerCallback]] = None,
+        #奖励处理类，为奖励函数提供数据处理
+        callbacks: Optional[list[TrainerCallback]] = None, #回调函数列表，日志保存，模型保存等
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
-        peft_config: Optional["PeftConfig"] = None,
+        #优化器和学习率调度器
+        peft_config: Optional["PeftConfig"] = None, #LoRA 配置对象
     ):
         # Args
-        if args is None:
+        if args is None: #arg为空时
+            #有实例化模型时，使用模型的配置初始化参数，否则使用模型名称或路径初始化参数。
             model_name = model if isinstance(model, str) else model.config._name_or_path
+            #提取模型名称
             model_name = model_name.split("/")[-1]
+            #用提取的 model_name 创建一个新的 GRPOConfig 配置对象
             args = GRPOConfig(f"{model_name}-GRPO")
 
         # Models
         # Trained model
-        model_init_kwargs = args.model_init_kwargs or {}
-        if isinstance(model, str):
+        model_init_kwargs = args.model_init_kwargs or {} 
+        if isinstance(model, str): #如果模型是字符串
             model_id = model
             torch_dtype = model_init_kwargs.get("torch_dtype")
             if isinstance(torch_dtype, torch.dtype) or torch_dtype == "auto" or torch_dtype is None:
                 pass  # torch_dtype is already a torch.dtype or "auto" or None
             elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
+                #提取并改变torch_dtype的类型
                 torch_dtype = getattr(torch, torch_dtype)
+                """
+                getattr 动态地从 torch 模块中获取名为 torch_dtype 的属性。
+                如果 torch_dtype 是 "float32"，则 getattr(torch, "float32") 返回 torch.float32。
+                这种动态访问方式使代码更加灵活，能够根据用户输入或配置文件动态设置数据类型。
+                """
                 model_init_kwargs["torch_dtype"] = torch_dtype
             else:
                 raise ValueError(
@@ -201,17 +221,21 @@ class XGRPOTrainer(GRPOTrainer):
             # Disable caching if gradient checkpointing is enabled (not supported)
             model_init_kwargs["use_cache"] = (
                 False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
-            )
+            )# 有checkpoint不使用缓存
+            
             model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
-        else:
-            model_id = model.config._name_or_path
+            #加载一个因果语言模型（Causal Language Model）
+            #它使用了 Hugging Face 的 transformers 库中的 AutoModelForCausalLM 类，
+            #该类能够根据模型名称或路径自动加载适配的因果语言模型。
+        else: #model是一个实例化的模型
+            model_id = model.config._name_or_path #提取模型名称
             if args.model_init_kwargs is not None:
                 raise ValueError(
                     "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
                     "This argument can only be used when the `model` argument is a string."
                 )
 
-        if peft_config is not None:
+        if peft_config is not None: #使用LoRA配置对象
             if not is_peft_available():
                 raise ImportError("PEFT is required to use `peft_config`. Run `pip install peft`.")
             model = get_peft_model(model, peft_config)
@@ -220,14 +244,14 @@ class XGRPOTrainer(GRPOTrainer):
         if args.gradient_checkpointing:
             model = self._enable_gradient_checkpointing(model, args)
 
-        # Reference model
+        # Reference model 参考模型
         self.beta = args.beta
         if self.beta == 0.0:
             # If beta is 0.0, the reference model is not needed
             self.ref_model = None
-        elif is_deepspeed_zero3_enabled():
+        elif is_deepspeed_zero3_enabled():#加载一个id同先前初始模型的模型
             self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
-        elif is_peft_model(model):
+        elif is_peft_model(model): #使用LoRA，无需加载新模型
             # If PEFT is used, the reference model is not needed since the adapter can be disabled
             # to revert to the initial model.
             self.ref_model = None
@@ -236,17 +260,19 @@ class XGRPOTrainer(GRPOTrainer):
             self.ref_model = create_reference_model(model)
 
         # Processing class
-        if processing_class is None:
+        if processing_class is None: #未提供时，默认加载一个分词器
             processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
 
         # Reward functions
-        if not isinstance(reward_funcs, list):
+        if not isinstance(reward_funcs, list): #单个奖励函数时，转为列表
             reward_funcs = [reward_funcs]
         for i, reward_func in enumerate(reward_funcs):
             if isinstance(reward_func, str):
                 reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
                     reward_func, num_labels=1, **model_init_kwargs
                 )
+        #如果奖励函数是字符串（表示模型名称或路径）
+        #则通过 AutoModelForSequenceClassification 动态加载一个序列分类模型作为奖励函数。
         self.reward_funcs = reward_funcs
 
         # Reward weights
@@ -256,7 +282,8 @@ class XGRPOTrainer(GRPOTrainer):
                     f"Number of reward weights ({len(args.reward_weights)}) must match number of reward "
                     f"functions ({len(reward_funcs)})"
                 )
-            self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
+            self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32) 
+            #为什么数据类型不使用之前提取的torch_dtype？？？
         else:
             self.reward_weights = torch.ones(len(reward_funcs), dtype=torch.float32)
 
@@ -264,19 +291,22 @@ class XGRPOTrainer(GRPOTrainer):
         if reward_processing_classes is None:
             reward_processing_classes = [None] * len(reward_funcs)
         elif not isinstance(reward_processing_classes, list):
-            reward_processing_classes = [reward_processing_classes]
+            reward_processing_classes = [reward_processing_classes]#列表化，一致性
         else:
-            if len(reward_processing_classes) != len(reward_funcs):
+            if len(reward_processing_classes) != len(reward_funcs): #长度检查
                 raise ValueError("The number of reward processing classes must match the number of reward functions.")
 
         for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
             if isinstance(reward_func, PreTrainedModel):
-                if reward_processing_class is None:
+                if reward_processing_class is None: #如果奖励函数是一个预训练模型且未提供对应的处理类，则自动加载一个分词器。
                     reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
                 if reward_processing_class.pad_token_id is None:
+                    #确保奖励函数的分词器具有正确的填充标记（pad_token_id），以便处理输入序列时对齐。
                     reward_processing_class.pad_token = reward_processing_class.eos_token
+                    
                 # The reward model computes the reward for the latest non-padded token in the input sequence.
                 # So it's important to set the pad token ID to the padding token ID of the processing class.
+                #奖励模型会计算输入序列中最后一个非填充标记的奖励。 因此，将填充标记 ID 设置为处理类的填充标记 ID 非常重要。
                 reward_func.config.pad_token_id = reward_processing_class.pad_token_id
                 reward_processing_classes[i] = reward_processing_class
         self.reward_processing_classes = reward_processing_classes
