@@ -317,18 +317,19 @@ class XGRPOTrainer(GRPOTrainer):
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
-        self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
-        self.num_generations = args.num_generations  # = G in the GRPO paper
-        self.use_vllm = args.use_vllm
+        self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper 输出长度
+        self.num_generations = args.num_generations  # = G in the GRPO paper 组数
+        self.use_vllm = args.use_vllm  #vLLM 是一种优化的语言模型推理框架
 
         # Multi-step
-        self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
-        self.epsilon = args.epsilon
+        self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper 多步训练中的迭代次数
+        self.epsilon = args.epsilon # = 𝜖 in the GRPO paper clip时使用
         # Tracks the number of iterations (forward + backward passes), including those within a gradient accumulation cycle.
         self._step = 0
         # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
-        # `_get_train_sampler` and `_prepare_inputs`.
+        # `_get_train_sampler` and `_prepare_inputs`. 用于存储多个训练步骤中的输入数据。
         self._buffered_inputs = [None] * args.gradient_accumulation_steps
+        #gradient_accumulation_steps > 1）时，模型会在多个小批次上累积梯度，然后再进行一次优化更新。
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
         # input tensor associated with the key "input_ids". However, in GRPO, the sampled data does not include the
@@ -354,6 +355,8 @@ class XGRPOTrainer(GRPOTrainer):
         )
 
         # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
+        #确保全局训练批量大小（global_batch_size）能够被每个提示生成的候选数量（num_generations）整除。
+        #这是为了保证数据分布的均匀性和训练过程的正确性。
         num_processes = self.accelerator.num_processes
         global_batch_size = args.per_device_train_batch_size * num_processes
         possible_values = [n_gen for n_gen in range(2, global_batch_size + 1) if (global_batch_size) % n_gen == 0]
@@ -376,6 +379,7 @@ class XGRPOTrainer(GRPOTrainer):
         # Ensure each process receives a unique seed to prevent duplicate completions when generating with
         # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
         # it's safer to set it in all cases.
+        #确保每个进程接收到唯一的随机种子，避免生成重复的输出。
         set_seed(args.seed, device_specific=True)
 
         if self.use_vllm:
@@ -424,11 +428,11 @@ class XGRPOTrainer(GRPOTrainer):
                         # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
                         # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
                         # This is particularly useful here because we generate completions from the same prompts.
-                        enable_prefix_caching=True,
+                        enable_prefix_caching=True, #启用前缀缓存（enable_prefix_caching），以便重复使用相同提示的缓存，提高生成效率
                         max_model_len=self.args.vllm_max_model_len,
                     )
                 self.sampling_params = SamplingParams(
-                    temperature=args.temperature,
+                    temperature=args.temperature, #控制生成的随机性，值越高生成越随机。
                     max_tokens=self.max_completion_length,
                     n=args.num_generations,
                 )
@@ -439,7 +443,7 @@ class XGRPOTrainer(GRPOTrainer):
             # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
             # synchronize all processes after vLLM has been fully initialized.
             self.accelerator.wait_for_everyone()
-        else:
+        else: #不使用vLLM时，使用常规的生成配置
             self.generation_config = GenerationConfig(
                 max_new_tokens=self.max_completion_length,
                 do_sample=True,
@@ -454,16 +458,18 @@ class XGRPOTrainer(GRPOTrainer):
 
         # Add tags to the model
         self.model.add_model_tags(self._tag_names)
-
+        #模型和参考模型的准备
         if self.ref_model is not None:
             if self.is_deepspeed_enabled:
                 self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
             else:
                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
 
+        #是否同步参考模型
         if args.sync_ref_model:
             self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
-
+        
+        #奖励函数的准备
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
@@ -475,7 +481,7 @@ class XGRPOTrainer(GRPOTrainer):
         logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
         logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
 
-        input_ids = input_ids[:, -logits_to_keep:]
+        input_ids = input_ids[:, -logits_to_keep:]  #只保留输入序列中最后 logits_to_keep 个标记的 ID。
         # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
         # See https://github.com/huggingface/trl/issues/2770
         logits = logits[:, -logits_to_keep:]
@@ -517,9 +523,12 @@ class XGRPOTrainer(GRPOTrainer):
 
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+        #字典包含了模型所需的输入数据，例如 input_ids、attention_mask 或其他自定义字段。。
         mode = "eval" if self.control.should_evaluate else "train"
         if mode == "train":
             if self.state.global_step % self.num_iterations == 0:
+                #计算当前全局步数是否需要重新生成输入
+                #如果当前步数是 num_iterations 的倍数，则重新生成输入；否则复用缓冲区中的输入
                 inputs = self._generate_and_score_completions(inputs)
                 self._buffered_inputs[self._step % self.args.gradient_accumulation_steps] = inputs
             else:
@@ -530,20 +539,21 @@ class XGRPOTrainer(GRPOTrainer):
             inputs = self._generate_and_score_completions(inputs)
         return inputs
 
+    #生成和评分完成
     def _generate_and_score_completions(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
-        prompts = [x["prompt"] for x in inputs]
-        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-        prompt_inputs = self.processing_class(
+        prompts = [x["prompt"] for x in inputs] #提取提示词
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs] #进行输入模版化预处理
+        prompt_inputs = self.processing_class( #将提示词转换为模型输入tensor，左对齐填充
             prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
         # prompt_inputs = super()._prepare_inputs(prompt_inputs)
         prompt_inputs = Trainer._prepare_inputs(self, inputs = prompt_inputs)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
-        if self.max_prompt_length is not None:
+        if self.max_prompt_length is not None: #截断提示词
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
@@ -553,8 +563,9 @@ class XGRPOTrainer(GRPOTrainer):
             if self.state.global_step != self._last_loaded_step:
                 self._move_model_to_vllm()
                 self._last_loaded_step = self.state.global_step
-
+            
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+            #收集和去重prompts
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
                 ordered_set_of_prompts = list(dict.fromkeys(all_prompts_text))
@@ -596,15 +607,15 @@ class XGRPOTrainer(GRPOTrainer):
             # Regular generation path
             prompt_ids = prompt_ids.to(device)
             prompt_mask = prompt_mask.to(device)
-            with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+            with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model: #解包模型
                 prompt_completion_ids = unwrapped_model.generate(
                     prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
                 )
 
             # Compute prompt length and extract completion ids
             prompt_length = prompt_ids.size(1)
-            prompt_ids = prompt_completion_ids[:, :prompt_length]
-            completion_ids = prompt_completion_ids[:, prompt_length:]
+            prompt_ids = prompt_completion_ids[:, :prompt_length] #原始输入
+            completion_ids = prompt_completion_ids[:, prompt_length:] #只包含输出
 
 
             prompt_string = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
@@ -615,9 +626,13 @@ class XGRPOTrainer(GRPOTrainer):
                 print("\n【ASSISTANT】:", completion)
 
         # Mask everything after the first EOS token
+        #检查生成的标记序列 completion_ids 中哪些位置是结束标记（EOS token）。
         is_eos = completion_ids == self.processing_class.eos_token_id
+        #创建一个张量 eos_idx，初始值为生成序列的长度 is_eos.size(1)。该张量用于存储每个序列中第一个结束标记的位置
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        #将 eos_idx 中每个序列中第一个结束标记的位置更新为 is_eos 中第一个为 1 的位置。
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        #生成mask
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
@@ -630,21 +645,25 @@ class XGRPOTrainer(GRPOTrainer):
         with torch.no_grad():
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
+            #在多次迭代的情况下，需要计算旧的对数概率
             if self.num_iterations > 1:
                 old_per_token_logps = self._get_per_token_logps(
                     self.model, prompt_completion_ids, attention_mask, logits_to_keep
                 )
             else:
                 old_per_token_logps = None
-
+            
             if self.beta == 0.0:
+                #此时不计算参考模型的对数概率
                 ref_per_token_logps = None
             elif self.ref_model is not None:
+                #计算参考模型的对数概率
                 print('is not peft')
                 ref_per_token_logps = self._get_per_token_logps(
                     self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
                 )
             else:
+                #计算去除LoRA模型的对数概率
                 print('is peft')
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
                     ref_per_token_logps = self._get_per_token_logps(
@@ -653,7 +672,7 @@ class XGRPOTrainer(GRPOTrainer):
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        if is_conversational(inputs[0]):
+        if is_conversational(inputs[0]): #如果是对话模式，将生成的对话拼接到提示词
             completions = []
             for prompt, completion in zip(prompts, completions_text):
                 bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
@@ -661,11 +680,12 @@ class XGRPOTrainer(GRPOTrainer):
         else:
             completions = completions_text
 
-        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device) #奖励函数的输出
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
             if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                #包装发送给reward model的inputs
                 if is_conversational(inputs[0]):
                     messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
@@ -686,7 +706,7 @@ class XGRPOTrainer(GRPOTrainer):
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
-        rewards_per_func = gather(rewards_per_func)
+        rewards_per_func = gather(rewards_per_func) #收集不同随机种子得到的回答的奖励
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
@@ -792,13 +812,13 @@ class XGRPOTrainer(GRPOTrainer):
         # _generate_and_score_completions) and use per_token_logps.detach() instead.
         old_per_token_logps = inputs["old_per_token_logps"] if self.num_iterations > 1 else per_token_logps.detach()
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
-        coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
+        coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon) #clip
         per_token_loss1 = coef_1 * advantages.unsqueeze(1)
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
-        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum() #计算损失
 
         # Log the metrics
         mode = "eval" if self.control.should_evaluate else "train"
